@@ -1,0 +1,19 @@
+# VibeGuard built-in rules — MINIMAL Phase-1 seed set.
+# The full rule set (secrets, sensitive paths, dangerous commands) lands in
+# Phase 2 (TASKS.md P2.1). These seed rules exist so the Phase-1 pipeline,
+# CLI wiring, and e2e gate are exercisable end-to-end.
+# Keys per contract: id, severity, pattern, message, scope ("line"|"path").
+
+[[rule]]
+id = "secret.aws-access-key"
+severity = "error"
+pattern = 'AKIA[0-9A-Z]{16}'
+message = "Possible AWS access key"
+scope = "line"
+
+[[rule]]
+id = "merge.conflict-marker"
+severity = "warn"
+pattern = '^<<<<<<< '
+message = "Merge conflict marker in added line"
+scope = "line"
