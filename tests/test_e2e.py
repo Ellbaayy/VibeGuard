@@ -174,6 +174,33 @@ def test_e2e_stdin_scan(temp_repo: Path) -> None:
     assert "no findings" in proc.stdout
 
 
+def test_e2e_stdin_non_utf8_does_not_crash(temp_repo: Path) -> None:
+    """Regression (QA P2): non-UTF-8 bytes on stdin must not crash (ARCH §8);
+    the diff is decoded with replacement, so the scan completes normally."""
+    # A valid diff whose added line contains an invalid UTF-8 byte sequence.
+    raw = (
+        b"diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n"
+        b"-old\n+new \xff\xfe line\n"
+    )
+    exe = REPO_ROOT / ".venv" / "bin" / "vibeguard"
+    if exe.exists():
+        argv = [str(exe), "scan", "-"]
+    else:
+        argv = [
+            sys.executable,
+            "-c",
+            "from vibeguard.cli import main; raise SystemExit(main())",
+            "scan",
+            "-",
+        ]
+    env = dict(os.environ)
+    if not exe.exists():
+        env["PYTHONPATH"] = str(REPO_ROOT / "src")
+    proc = subprocess.run(argv, cwd=temp_repo, capture_output=True, env=env, input=raw)
+    # exit 0 (no finding) — NOT exit 2 (internal error / crash).
+    assert proc.returncode == 0, f"stderr={proc.stderr!r}"
+
+
 def test_e2e_version() -> None:
     proc = _scan(REPO_ROOT, "--version")
     assert proc.returncode == 0

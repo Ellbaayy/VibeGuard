@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from conftest import git
 
 from vibeguard.core.diff import (
@@ -235,3 +236,256 @@ def test_parse_no_newline_marker() -> None:
     )
     files = parse_unified_diff(diff_text)
     assert files[0].added_lines == [(1, "b")]
+
+
+# ------------------------------------------------- plain `diff -u` (no git)
+
+
+def test_parse_plain_diff_u_without_git_headers() -> None:
+    """Regression (QA P2): plain `diff -u` output has no `diff --git` header and
+    appends a tab+timestamp to ---/+++ paths. It must NOT be silently ignored."""
+    diff_text = (
+        "--- a.txt\t2024-01-01 00:00:00.000000000 +0000\n"
+        "+++ b.txt\t2024-01-01 00:00:00.000000000 +0000\n"
+        "@@ -1,2 +1,3 @@\n"
+        " context\n"
+        "-old\n"
+        "+new\n"
+    )
+    files = parse_unified_diff(diff_text)
+    assert len(files) == 1
+    assert files[0].path == "b.txt"
+    assert files[0].added_lines == [(2, "new")]
+
+
+def test_parse_plain_diff_u_no_timestamp() -> None:
+    diff_text = (
+        "--- a.txt\n"
+        "+++ b.txt\n"
+        "@@ -1 +1 @@\n"
+        "-x\n"
+        "+y\n"
+    )
+    files = parse_unified_diff(diff_text)
+    assert len(files) == 1
+    assert files[0].path == "b.txt"
+    assert files[0].added_lines == [(1, "y")]
+
+
+# ------------------------------------------------- quoted / non-ASCII paths
+
+
+def test_parse_quoted_path_git_prefix_inside_quotes() -> None:
+    """Regression (QA P2): git's REAL quoted form wraps the whole `b/...`
+    segment in quotes. The `b/` prefix must be stripped, not retained."""
+    diff_text = (
+        'diff --git "a/we ird.py" "b/we ird.py"\n'
+        '--- "a/we ird.py"\n'
+        '+++ "b/we ird.py"\n'
+        "@@ -1 +1 @@\n"
+        "-a\n"
+        "+b\n"
+    )
+    files = parse_unified_diff(diff_text)
+    assert files[0].path == "we ird.py"
+
+
+def test_parse_quoted_path_non_ascii_octal_escapes() -> None:
+    """Regression (QA P2): git quotes non-ASCII path bytes as octal escapes
+    (`\\303\\251` = 'é'). These must decode, not be left literal."""
+    diff_text = (
+        'diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n'
+        '--- "a/caf\\303\\251.py"\n'
+        '+++ "b/caf\\303\\251.py"\n'
+        "@@ -1 +1 @@\n"
+        "-a\n"
+        "+b\n"
+    )
+    files = parse_unified_diff(diff_text)
+    assert files[0].path == "café.py"
+
+
+def test_parse_quoted_path_retains_escaped_quote_and_backslash() -> None:
+    diff_text = (
+        'diff --git "a/x\\"y.py" "b/x\\"y.py"\n'
+        '--- "a/x\\"y.py"\n'
+        '+++ "b/x\\"y.py"\n'
+        "@@ -1 +1 @@\n"
+        "-a\n"
+        "+b\n"
+    )
+    files = parse_unified_diff(diff_text)
+    assert files[0].path == 'x"y.py'
+
+
+def test_parse_normal_path_unaffected() -> None:
+    diff_text = (
+        "diff --git a/plain.py b/plain.py\n--- a/plain.py\n+++ b/plain.py\n"
+        "@@ -1 +1 @@\n-a\n+b\n"
+    )
+    files = parse_unified_diff(diff_text)
+    assert files[0].path == "plain.py"
+
+
+# ------------------------------------------------- spoofed +++ inside hunk
+
+
+def test_parse_spoofed_plusplusplus_inside_hunk_is_content() -> None:
+    """Regression (QA P3): an added line that looks like `+++ ...` inside a hunk
+    must be treated as content, NOT as a new file header (attribution)."""
+    diff_text = (
+        "diff --git a/real.py b/real.py\n"
+        "--- a/real.py\n"
+        "+++ b/real.py\n"
+        "@@ -1 +1,2 @@\n"
+        "-old\n"
+        "+new\n"
+        "+++ b/evil.py\n"
+    )
+    files = parse_unified_diff(diff_text)
+    assert len(files) == 1  # not two files
+    assert files[0].path == "real.py"
+    texts = [t for _, t in files[0].added_lines]
+    assert "++ b/evil.py" in texts
+
+
+# ------------------------------------------------- stdin source (B2)
+
+
+def test_stdin_source_none_stdin_raises_diff_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression (B2): `sys.stdin` None must raise a clean DiffError, not a
+    raw AttributeError."""
+    import sys
+
+    from vibeguard.core.diff import DiffError, StdinSource
+
+    monkeypatch.setattr(sys, "stdin", None)
+    with pytest.raises(DiffError, match="no stdin available"):
+        StdinSource().collect()
+
+
+def test_stdin_source_without_buffer_raises_diff_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (B2): a stdin stream without a ``.buffer`` attribute (e.g. a
+    closed/unavailable stream) must raise a clean DiffError."""
+    import sys
+
+    from vibeguard.core.diff import DiffError, StdinSource
+
+    class NoBuffer:
+        pass
+
+    monkeypatch.setattr(sys, "stdin", NoBuffer())
+    with pytest.raises(DiffError, match="no stdin available"):
+        StdinSource().collect()
+
+
+def test_stdin_source_reads_bytes_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression (B2): normal stdin with a buffer still works (non-regression
+    for the existing successful path)."""
+    import sys
+
+    from vibeguard.core.diff import StdinSource
+
+    class FakeBuffer:
+        def __init__(self, data: bytes) -> None:
+            self._data = data
+
+        def read(self) -> bytes:
+            return self._data
+
+    class FakeStdin:
+        def __init__(self, data: bytes) -> None:
+            self.buffer = FakeBuffer(data)
+
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        FakeStdin(
+            b"diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n"
+        ),
+    )
+    files = StdinSource().collect()
+    assert [f.path for f in files] == ["x.py"]
+    assert files[0].added_lines == [(1, "new")]
+
+
+# ------------------------------------------------- malformed hunk header (B3)
+
+
+def test_parse_malformed_hunk_header_does_not_crash() -> None:
+    """Regression (B3): a hunk header that does not match the expected
+    ``@@ -a,b +c,d @@`` shape must not crash the parser. The line is ignored
+    (no hunk opens, so no added lines are recorded) — aligned with the current
+    contract which only recognizes well-formed hunk headers."""
+    diff_text = (
+        "diff --git a/x.py b/x.py\n"
+        "--- a/x.py\n"
+        "+++ b/x.py\n"
+        "@@ this is not a valid hunk header @@\n"
+        "+should_not_be_treated_as_added\n"
+    )
+    files = parse_unified_diff(diff_text)
+    assert len(files) == 1
+    assert files[0].path == "x.py"
+    # No valid hunk opened, so the '+' line is not recorded as an added line.
+    assert files[0].added_lines == []
+
+
+# ------------------------------------------------- removed-line lookalike (B4)
+
+
+def test_parse_removed_line_minusminusminus_lookalike() -> None:
+    """Regression (B4): a removed line whose content looks like `--- ...` must
+    remain a removed line, not be mistaken for a file header. It must not
+    create a phantom file entry nor enter added_lines."""
+    diff_text = (
+        "diff --git a/real.py b/real.py\n"
+        "--- a/real.py\n"
+        "+++ b/real.py\n"
+        "@@ -1,2 +1,1 @@\n"
+        " context\n"
+        "---- removed content lookalike\n"
+    )
+    files = parse_unified_diff(diff_text)
+    assert len(files) == 1
+    assert files[0].path == "real.py"
+    assert files[0].added_lines == []
+
+
+def test_parse_removed_line_plusplusplus_lookalike() -> None:
+    """Regression (B4): a removed line whose content looks like `+++ ...` must
+    remain a removed line, not be mistaken for a file header."""
+    diff_text = (
+        "diff --git a/real.py b/real.py\n"
+        "--- a/real.py\n"
+        "+++ b/real.py\n"
+        "@@ -1,2 +1,1 @@\n"
+        " context\n"
+        "-+++ removed content lookalike\n"
+    )
+    files = parse_unified_diff(diff_text)
+    assert len(files) == 1
+    assert files[0].path == "real.py"
+    assert files[0].added_lines == []
+
+
+# ------------------------------------- quoted/non-ASCII fixture from real git
+
+
+def test_parse_quoted_path_from_real_git_output() -> None:
+    """Lock the exact quoted-path shape real git emits (prefix inside quotes,
+    octal escapes for non-ASCII bytes) with a literal golden fixture."""
+    diff_text = (
+        'diff --git "a/we ird caf\\303\\251.txt" "b/we ird caf\\303\\251.txt"\n'
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        '+++ "b/we ird caf\\303\\251.txt"\n'
+        "@@ -0,0 +1 @@\n"
+        "+x\n"
+    )
+    files = parse_unified_diff(diff_text)
+    assert len(files) == 1
+    assert files[0].path == "we ird café.txt"
+    assert files[0].added_lines == [(1, "x")]

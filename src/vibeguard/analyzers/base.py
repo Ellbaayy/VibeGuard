@@ -6,13 +6,10 @@ import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
-from vibeguard.core.result import Severity
-
-if TYPE_CHECKING:
-    from vibeguard.core.diff import DiffFile
-    from vibeguard.core.result import Finding
+from vibeguard.core.diff import DiffFile
+from vibeguard.core.result import Finding, Severity
 
 
 class ConfigError(Exception):
@@ -134,3 +131,55 @@ BUILTIN_RULES_PATH = Path(__file__).resolve().parent.parent / "rules" / "builtin
 def load_builtin_rules() -> list[RuleDef]:
     """Load the shipped rules/builtins.toml (minimal Phase-1 seed set)."""
     return load_rules(BUILTIN_RULES_PATH)
+
+
+class RuleAnalyzer:
+    """Data-driven analyzer over rule definitions (line + path scope).
+
+    The generic engine that turns ``RuleDef`` records into ``Finding``s. Phase 2
+    adds the dedicated analyzer modules (secrets.py, sensitive_paths.py,
+    dangerous_cmd.py) on top of the same contracts.
+    """
+
+    def __init__(self, rules: list[RuleDef]) -> None:
+        self.id = "rules"
+        self._rules = rules
+        self._compiled = [(r, re.compile(r.pattern)) for r in rules]
+
+    def analyze(self, files: list[DiffFile], config: object) -> list[Finding]:
+        findings: list[Finding] = []
+        for f in files:
+            for rule, pattern in self._compiled:
+                if rule.scope == "path":
+                    # Path-scope rules run regardless of f.binary (ARCH §8:
+                    # binary skips *content* analysis only, never path analysis).
+                    if pattern.search(f.path):
+                        findings.append(
+                            Finding(
+                                rule_id=rule.id,
+                                severity=rule.severity,
+                                file=f.path,
+                                line=None,
+                                message=rule.message,
+                                snippet="",
+                                source="rule",
+                            )
+                        )
+                    continue
+                # line scope: binary files have no added lines to analyze.
+                if f.binary:
+                    continue
+                for lineno, text in f.added_lines:
+                    if pattern.search(text):
+                        findings.append(
+                            Finding(
+                                rule_id=rule.id,
+                                severity=rule.severity,
+                                file=f.path,
+                                line=lineno,
+                                message=rule.message,
+                                snippet=text,
+                                source="rule",
+                            )
+                        )
+        return findings

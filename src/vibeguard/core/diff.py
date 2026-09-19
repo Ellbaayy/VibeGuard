@@ -48,36 +48,85 @@ _BINARY_RE = re.compile(r"^Binary files (.*?) and (.*) differ$")
 
 
 def _unquote(token: str) -> str:
-    """Unquote a C-style quoted diff path (git quotes unusual filenames)."""
-    if len(token) >= 2 and token.startswith('"') and token.endswith('"'):
-        return (
-            token[1:-1]
-            .replace("\\\\", "\\")
-            .replace('\\"', '"')
-            .replace("\\n", "\n")
-            .replace("\\t", "\t")
-        )
-    return token
+    """Unquote a C-style quoted diff path (git quotes unusual filenames).
+
+    Handles the full git escape set: ``\\\\`` -> ``\\``, ``\\"`` -> ``"``,
+    ``\\n``/``\\t``/``\\r`` control escapes, and octal byte escapes
+    (``\\303\\251`` -> ``é``) which git emits for non-ASCII path bytes.
+    The inner text is decoded byte-by-byte and re-decoded as UTF-8 so that
+    multi-byte octal sequences form correct characters.
+    """
+    if not (len(token) >= 2 and token.startswith('"') and token.endswith('"')):
+        return token
+    inner = token[1:-1]
+    out = bytearray()
+    i = 0
+    n = len(inner)
+    while i < n:
+        ch = inner[i]
+        if ch != "\\" or i + 1 >= n:
+            out.extend(ch.encode("utf-8", errors="replace"))
+            i += 1
+            continue
+        nxt = inner[i + 1]
+        if nxt == "\\":
+            out.extend(b"\\")
+            i += 2
+        elif nxt == '"':
+            out.extend(b'"')
+            i += 2
+        elif nxt == "n":
+            out.extend(b"\n")
+            i += 2
+        elif nxt == "t":
+            out.extend(b"\t")
+            i += 2
+        elif nxt == "r":
+            out.extend(b"\r")
+            i += 2
+        elif nxt in "01234567" and i + 4 <= n and all(
+            c in "01234567" for c in inner[i + 1 : i + 4]
+        ):
+            out.append(int(inner[i + 1 : i + 4], 8))
+            i += 4
+        else:
+            # Unknown escape: keep the backslash literally.
+            out.extend(b"\\")
+            i += 1
+    return out.decode("utf-8", errors="replace")
 
 
 def _clean_path(token: str) -> str | None:
-    """Normalize a diff path token: /dev/null -> None, strip a/ b/ prefixes."""
+    """Normalize a diff path token: /dev/null -> None, strip a/ b/ prefixes.
+
+    Handles BOTH quoting layouts git has emitted over time:
+      - ``b/"we ird.py"``  (prefix outside the quotes)
+      - ``"b/we ird.py"``  (prefix inside the quotes)
+    by unquoting and prefix-stripping in two passes.
+    """
     token = token.strip()
     if token == "/dev/null":
         return None
+    token = _unquote(token)
     if token.startswith("a/") or token.startswith("b/"):
         token = token[2:]
-    return _unquote(token) or None
+    token = _unquote(token)
+    return token or None
 
 
 def _header_paths(rest: str) -> tuple[str | None, str | None]:
     """Fallback path extraction from the 'diff --git a/x b/x' header line.
 
     Only used when ---/+++/rename lines are absent (e.g. mode-only changes).
+    Handles both unquoted and quoted paths.
     """
-    if " b/" in rest:
-        old, new = rest.split(" b/", 1)
-        return _clean_path(old), _clean_path("b/" + new)
+    m = re.match(r"^a/(.*?) b/(.*)$", rest)
+    if m:
+        return _clean_path("a/" + m.group(1)), _clean_path("b/" + m.group(2))
+    # Quoted form: 'diff --git "a/x y" "b/x y"' — split on the ' ' boundary.
+    m = re.match(r'^"(.*?)" "(.*)"$', rest)
+    if m:
+        return _clean_path('"' + m.group(1) + '"'), _clean_path('"' + m.group(2) + '"')
     return None, None
 
 
@@ -100,39 +149,98 @@ class _Entry:
         return DiffFile(path=path, added_lines=self.added, binary=self.binary)
 
 
+def _strip_ts(token: str) -> str:
+    """Strip the tab + timestamp GNU diff appends to ``---``/``+++`` paths.
+
+    Git also emits a trailing tab after quoted paths; cutting at the first tab
+    normalizes both. (Raw tabs inside a path are quoted by git, so this split
+    never corrupts a real filename.)
+    """
+    return token.split("\t", 1)[0]
+
+
 def parse_unified_diff(text: str) -> list[DiffFile]:
     """Parse a unified diff into a list of DiffFile (pure function).
 
     Handles: new files, modified files, renames, deletions (no added lines),
-    binary markers, /dev/null paths, CRLF line endings (trailing CR stripped
-    from added-line text), and hunk no-newline-at-eof markers.
+    binary markers, /dev/null paths, CRLF line endings, hunk no-newline-at-eof
+    markers, plain ``diff -u`` output without git headers (used by the future
+    MCP review_diff), and quoted/non-ASCII git paths.
+
+    A ``--- ``/``+++ `` PAIR is a file header; a lone ``+++ ``/``--- `` inside a
+    hunk is content (this prevents an added line that looks like ``+++ ...``
+    from being mis-attributed as a new file header).
     """
     files: list[DiffFile] = []
     entry: _Entry | None = None
+    lines = text.split("\n")
 
     def finalize(current: _Entry) -> None:
         df = current.diff_file()
         if df is not None:
             files.append(df)
 
-    for raw in text.split("\n"):
+    i = 0
+    n = len(lines)
+    while i < n:
+        raw = lines[i]
         line = raw[:-1] if raw.endswith("\r") else raw
+
         if line.startswith("diff --git "):
             if entry is not None:
                 finalize(entry)
             entry = _Entry()
             entry.header = _header_paths(line[len("diff --git ") :])
+            i += 1
             continue
+
+        # A `--- `/`+++ ` pair is a file header (git content changes AND plain
+        # `diff -u` which has no `diff --git` line).
+        if (
+            line.startswith("--- ")
+            and i + 1 < n
+            and lines[i + 1].lstrip("\r").startswith("+++ ")
+        ):
+            if entry is not None and (entry.old is not None or entry.new is not None):
+                finalize(entry)  # previous file (plain diff -u multi-file)
+                entry = None
+            if entry is None:
+                entry = _Entry()
+            entry.old = _clean_path(_strip_ts(line[4:]))
+            entry.new = _clean_path(_strip_ts(lines[i + 1].lstrip("\r")[4:]))
+            i += 2
+            continue
+
         if entry is None:
-            continue  # preamble (e.g. commit message) — ignore
+            i += 1  # preamble (e.g. commit message) — ignore
+            continue
+
+        if entry.in_hunk:
+            if line.startswith("@@"):
+                match = _HUNK_RE.match(line)
+                if match:
+                    entry.lineno = int(match.group(1))
+            elif line.startswith("+"):
+                entry.added.append((entry.lineno, line[1:]))
+                entry.lineno += 1
+            elif line.startswith("-"):
+                pass  # removed line
+            elif line.startswith("\\"):
+                pass  # "\ No newline at end of file"
+            else:
+                entry.lineno += 1  # context line
+            i += 1
+            continue
+
+        # Not in a hunk: file metadata / headers.
         if line.startswith("--- "):
-            entry.old = _clean_path(line[4:])
+            entry.old = _clean_path(_strip_ts(line[4:]))
         elif line.startswith("+++ "):
-            entry.new = _clean_path(line[4:])
+            entry.new = _clean_path(_strip_ts(line[4:]))
         elif line.startswith("rename from "):
-            entry.old = line[len("rename from ") :]
+            entry.old = _unquote(line[len("rename from ") :].strip())
         elif line.startswith("rename to "):
-            entry.new = line[len("rename to ") :]
+            entry.new = _unquote(line[len("rename to ") :].strip())
         elif line.startswith("Binary files ") and line.endswith(" differ"):
             match = _BINARY_RE.match(line)
             if match:
@@ -144,17 +252,8 @@ def parse_unified_diff(text: str) -> list[DiffFile]:
             if match:
                 entry.in_hunk = True
                 entry.lineno = int(match.group(1))
-        elif not entry.in_hunk:
-            continue
-        elif line.startswith("+"):
-            entry.added.append((entry.lineno, line[1:]))
-            entry.lineno += 1
-        elif line.startswith("-"):
-            pass  # removed line
-        elif line.startswith("\\"):
-            pass  # "\ No newline at end of file"
-        else:
-            entry.lineno += 1  # context line
+        # else: index/mode/similarity lines — ignored.
+        i += 1
 
     if entry is not None:
         finalize(entry)
@@ -235,7 +334,18 @@ class DiffFileSource:
 
 
 class StdinSource:
-    """Read a unified diff from stdin (`vibeguard scan -`)."""
+    """Read a unified diff from stdin (`vibeguard scan -`).
+
+    Reads raw bytes and decodes with ``errors="replace"`` so non-UTF-8 input
+    never crashes (ARCHITECTURE §8) — mirroring DiffFileSource's behavior.
+    Raises a clean DiffError when stdin is unavailable (e.g. closed or
+    redirected from a non-tty without data) instead of leaking a Python
+    AttributeError.
+    """
 
     def collect(self) -> list[DiffFile]:
-        return parse_unified_diff(sys.stdin.read())
+        stream = sys.stdin
+        if stream is None or getattr(stream, "buffer", None) is None:
+            raise DiffError("no stdin available")
+        data = stream.buffer.read()
+        return parse_unified_diff(data.decode("utf-8", errors="replace"))

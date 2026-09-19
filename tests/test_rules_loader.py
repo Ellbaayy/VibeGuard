@@ -10,9 +10,13 @@ from conftest import MockAnalyzer
 from vibeguard.analyzers.base import (
     ConfigError,
     Registry,
+    RuleAnalyzer,
+    RuleDef,
     load_builtin_rules,
     load_rules,
 )
+from vibeguard.core.diff import DiffFile
+from vibeguard.core.result import Severity
 
 VALID = """
 [[rule]]
@@ -124,3 +128,75 @@ def test_registry_rejects_no_id() -> None:
     except ConfigError:
         return
     raise AssertionError("analyzer without id should be rejected")
+
+
+# ------------------------------------------------------------ RuleAnalyzer
+
+
+def test_aws_key_boundaries_no_false_positive() -> None:
+    """Regression (QA P2.1): `XXAKIA...` must NOT match — the pattern requires
+    a non-alphanumeric boundary on BOTH sides, so an AWS key embedded in a
+    longer identifier is not flagged."""
+    from vibeguard.analyzers.base import RuleAnalyzer, load_builtin_rules
+    from vibeguard.core.diff import DiffFile
+
+    analyzer = RuleAnalyzer(load_builtin_rules())
+    # 'AKIA' + 16 uppercase alnum inside a longer alphanumeric identifier.
+    fp = DiffFile(path="a.py", added_lines=[(1, "const XXAKIAABCDEFGHIJKLMNOPYZ = 1")])
+    findings = analyzer.analyze([fp], object())
+    assert not [f for f in findings if f.rule_id == "secret.aws-access-key"]
+
+
+def test_aws_key_boundaries_still_matches_real_key() -> None:
+    """Regression: a standalone AWS key (proper 16-char suffix, non-alnum
+    boundaries) still matches."""
+    from vibeguard.analyzers.base import RuleAnalyzer, load_builtin_rules
+    from vibeguard.core.diff import DiffFile
+
+    analyzer = RuleAnalyzer(load_builtin_rules())
+    df = DiffFile(path="a.py", added_lines=[(1, "key = 'AKIAABCDEFGHIJKLMNOP'")])
+    findings = analyzer.analyze([df], object())
+    assert any(f.rule_id == "secret.aws-access-key" for f in findings)
+
+
+# ------------------------------------------------ binary files (B1 regression)
+
+
+def _path_analyzer(*patterns: str) -> RuleAnalyzer:
+    rules = [
+        RuleDef(
+            id=f"sensitive.path{i}",
+            severity=Severity.WARN,
+            pattern=p,
+            message="sensitive path",
+            scope="path",
+        )
+        for i, p in enumerate(patterns)
+    ]
+    return RuleAnalyzer(rules)
+
+
+def test_binary_file_still_triggers_path_scope_rule() -> None:
+    """Regression (B1): a binary file must still be evaluated by path-scope
+    rules (ARCH §8 skips *content* analysis only, never path analysis)."""
+    analyzer = _path_analyzer(r"(^|/)\.env$", r"id_rsa", r"\.pem$")
+    for path in (".env", "secrets/id_rsa", "private.pem"):
+        df = DiffFile(path=path, added_lines=[], binary=True)
+        findings = analyzer.analyze([df], object())
+        assert any(f.rule_id.startswith("sensitive.path") for f in findings), path
+
+
+def test_binary_file_skips_line_content_analysis() -> None:
+    """Regression (B1): binary files must NOT undergo line/content analysis —
+    added lines (if any) are never scanned for line-scope rules."""
+    secret = RuleDef(
+        id="secret.leak",
+        severity=Severity.ERROR,
+        pattern="SECRET",
+        message="leak",
+        scope="line",
+    )
+    analyzer = RuleAnalyzer([secret])
+    df = DiffFile(path="blob.bin", added_lines=[(1, "SECRET_VALUE")], binary=True)
+    findings = analyzer.analyze([df], object())
+    assert findings == []  # no line analysis for binary files

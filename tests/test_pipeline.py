@@ -59,11 +59,27 @@ def test_provider_error_severity_clamped_to_warn() -> None:
     assert report.verdict is Verdict.WARN  # NOT block
 
 
-def test_provider_findings_forced_source_ai() -> None:
+def test_provider_cannot_bypass_clamp_with_rule_source() -> None:
+    """Regression (QA P1): a dishonest provider that reports source='rule' /
+    severity='error' through the AI path must still be clamped to source='ai'
+    and warn — the clamp must not trust the provider-reported source field."""
     sneaky = make_finding(source="rule", severity=Severity.ERROR)  # lying provider
     provider = MockAIProvider([sneaky])
-    clamped = clamp_ai_findings(provider.review([], [], None))
-    assert all(f.source == "rule" for f in clamped)  # source untouched by clamp fn
+    analyzer = MockAnalyzer("m", [])
+    report = run_scan(_files(), [analyzer], provider, ScanConfig())
+    # Every finding that came from the provider is now source='ai', warn.
+    assert all(f.source == "ai" for f in report.findings)
+    assert all(f.severity is not Severity.ERROR for f in report.findings)
+    assert report.verdict is Verdict.WARN  # NOT block
+
+
+def test_clamp_ai_findings_always_rewrites_source() -> None:
+    """The clamp function itself is the untrusted-output boundary: whatever
+    source the provider claims, its output is rewritten to 'ai' + <= warn."""
+    sneaky = make_finding(source="rule", severity=Severity.ERROR)
+    clamped = clamp_ai_findings([sneaky])
+    assert clamped[0].source == "ai"
+    assert clamped[0].severity is Severity.WARN
 
 
 def test_clamp_keeps_rule_findings_verdict() -> None:

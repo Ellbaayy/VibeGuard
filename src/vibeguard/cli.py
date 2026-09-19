@@ -8,19 +8,18 @@ exit codes 0/1/2/3 per ARCHITECTURE §4). rules/hook/mcp remain stubs
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 
 from vibeguard import __version__
+from vibeguard.analyzers import dangerous_cmd, secrets, sensitive_paths
 from vibeguard.analyzers.base import (
     Analyzer,
     ConfigError,
-    RuleDef,
+    RuleAnalyzer,
     load_builtin_rules,
 )
 from vibeguard.core.diff import (
     DiffError,
-    DiffFile,
     DiffFileSource,
     DiffSource,
     GitCommit,
@@ -29,7 +28,6 @@ from vibeguard.core.diff import (
     StdinSource,
 )
 from vibeguard.core.pipeline import ScanConfig, run_scan
-from vibeguard.core.result import Finding
 from vibeguard.formatters.text import format_text
 
 # Exit codes (ARCHITECTURE §4, frozen contract).
@@ -119,58 +117,23 @@ def build_parser() -> VibeGuardParser:
 # ------------------------------------------------------------ rule analyzer
 
 
-class RuleAnalyzer:
-    """Data-driven analyzer over rule definitions (line + path scope).
-
-    Phase 1 ships this generic engine so the seed rules in
-    rules/builtins.toml run end-to-end; Phase 2 adds the full rule set and
-    the dedicated analyzer modules (secrets.py, sensitive_paths.py,
-    dangerous_cmd.py) on top of the same contracts.
-    """
-
-    def __init__(self, rules: list[RuleDef]) -> None:
-        self.id = "rules"
-        self._rules = rules
-        self._compiled = [(r, re.compile(r.pattern)) for r in rules]
-
-    def analyze(self, files: list[DiffFile], config: object) -> list[Finding]:
-        findings: list[Finding] = []
-        for f in files:
-            if f.binary:
-                continue
-            for rule, pattern in self._compiled:
-                if rule.scope == "line":
-                    for lineno, text in f.added_lines:
-                        if pattern.search(text):
-                            findings.append(
-                                Finding(
-                                    rule_id=rule.id,
-                                    severity=rule.severity,
-                                    file=f.path,
-                                    line=lineno,
-                                    message=rule.message,
-                                    snippet=text,
-                                    source="rule",
-                                )
-                            )
-                else:  # path scope
-                    if pattern.search(f.path):
-                        findings.append(
-                            Finding(
-                                rule_id=rule.id,
-                                severity=rule.severity,
-                                file=f.path,
-                                line=None,
-                                message=rule.message,
-                                snippet="",
-                                source="rule",
-                            )
-                        )
-        return findings
-
-
 def _default_analyzers() -> list[Analyzer]:
-    return [RuleAnalyzer(load_builtin_rules())]
+    """The built-in analyzer set (Phase 2: dedicated modules + generic rest).
+
+    P2.1 compatibility change: the dedicated analyzers claim their id-prefix
+    subsets of builtins.toml; unclaimed rules (e.g. merge.*) keep running
+    through the generic RuleAnalyzer, so Phase-1 behavior is preserved and no
+    rule fires twice.
+    """
+    rules = load_builtin_rules()
+    claimed = (secrets.PREFIX, sensitive_paths.PREFIX, dangerous_cmd.PREFIX)
+    rest = [r for r in rules if not r.id.startswith(claimed)]
+    return [
+        secrets.SecretsAnalyzer(rules),
+        sensitive_paths.SensitivePathsAnalyzer(rules),
+        dangerous_cmd.DangerousCmdAnalyzer(rules),
+        RuleAnalyzer(rest),
+    ]
 
 
 # ------------------------------------------------------------ scan command
@@ -208,9 +171,10 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     if args.format == "json":
         print("vibeguard: error: --format json not implemented until Phase 2", file=sys.stderr)
         return EXIT_INTERNAL
-    if args.only or args.skip or args.max_findings is not None:
+    if args.config is not None or args.only or args.skip or args.max_findings is not None:
         print(
-            "vibeguard: error: --only/--skip/--max-findings not implemented until Phase 2",
+            "vibeguard: error: --config/--only/--skip/--max-findings not implemented "
+            "until Phase 2",
             file=sys.stderr,
         )
         return EXIT_INTERNAL
@@ -225,10 +189,6 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     if report.verdict.value == "block":
         return EXIT_BLOCK
     return EXIT_PASS
-
-
-def _empty_report_text() -> str:
-    return "no changes\nverdict: pass"
 
 
 # ------------------------------------------------------------ stub commands

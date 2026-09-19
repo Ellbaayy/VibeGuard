@@ -1,13 +1,19 @@
-# VibeGuard built-in rules — MINIMAL Phase-1 seed set.
-# The full rule set (secrets, sensitive paths, dangerous commands) lands in
-# Phase 2 (TASKS.md P2.1). These seed rules exist so the Phase-1 pipeline,
-# CLI wiring, and e2e gate are exercisable end-to-end.
+# VibeGuard built-in rules.
+# Phase-1 seed set + Phase-2 rule set (TASKS.md P2.1: secrets, sensitive
+# paths, dangerous commands). Ownership by id prefix:
+#   secret.* -> analyzers/secrets.py (line scope, added lines only)
+#   path.*   -> analyzers/sensitive_paths.py (path scope, any content)
+#   cmd.*    -> analyzers/dangerous_cmd.py (line scope, added lines only)
+# Unclaimed ids (e.g. merge.*) keep running through the generic RuleAnalyzer.
 # Keys per contract: id, severity, pattern, message, scope ("line"|"path").
+# Severity policy: conservative (Architect decision) — when in doubt, warn.
+# error is reserved for high-confidence credentials, secret-bearing paths,
+# and commands that are destructive / remote-code-execution by construction.
 
 [[rule]]
 id = "secret.aws-access-key"
 severity = "error"
-pattern = 'AKIA[0-9A-Z]{16}'
+pattern = '(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])'
 message = "Possible AWS access key"
 scope = "line"
 
@@ -16,4 +22,108 @@ id = "merge.conflict-marker"
 severity = "warn"
 pattern = '^<<<<<<< '
 message = "Merge conflict marker in added line"
+scope = "line"
+
+# ---- secrets (P2.1) ----
+
+[[rule]]
+id = "secret.github-token"
+severity = "error"
+pattern = 'ghp_[A-Za-z0-9]{36}'
+message = "Possible GitHub personal access token"
+scope = "line"
+
+[[rule]]
+id = "secret.private-key-block"
+severity = "error"
+pattern = '-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'
+message = "Private key material in added line"
+scope = "line"
+
+[[rule]]
+id = "secret.jwt-token"
+severity = "warn"
+pattern = '\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b'
+message = "JWT-looking string in added line"
+scope = "line"
+
+# ---- sensitive paths (P2.1) ----
+
+[[rule]]
+id = "path.dotenv-file"
+severity = "error"
+pattern = '(^|/)\.env$|(^|/)\.env\.(local|production|prod|development|dev|test|staging)(\..*)?$'
+message = "Sensitive .env file touched"
+scope = "path"
+
+[[rule]]
+id = "path.private-key-file"
+severity = "error"
+pattern = '(^|/)id_(rsa|dsa|ecdsa|ed25519)(_[^/]*)?$|[^/]+\.(pem|key|p12|pfx|jks)$'
+message = "Private key file touched"
+scope = "path"
+
+[[rule]]
+id = "path.credentials-file"
+severity = "error"
+pattern = '(?i)(^|/)(credentials|secrets)(\.[^/]+)?$'
+message = "Credentials file touched"
+scope = "path"
+
+[[rule]]
+id = "path.git-internal"
+severity = "error"
+pattern = '(^|/)\.git(/|$)'
+message = "Change inside .git internals"
+scope = "path"
+
+[[rule]]
+id = "path.ci-workflow-file"
+severity = "warn"
+pattern = '(^|/)\.github/workflows/[^/]+\.ya?ml$'
+message = "CI workflow file touched (review carefully)"
+scope = "path"
+
+# ---- dangerous commands (P2.1) ----
+
+[[rule]]
+id = "cmd.curl-pipe-shell"
+severity = "error"
+pattern = '(curl|wget)\b[^|]*\|\s*(sudo\s+)?(sh|bash|dash|zsh|fish)\b'
+message = "Piped remote script to shell (curl|wget ... | sh)"
+scope = "line"
+
+[[rule]]
+id = "cmd.rm-rf-root"
+severity = "error"
+pattern = '\brm\s+(?:-[^;\s|&]+\s+)*/(?:[\s;]|$)'
+message = "Recursive delete rooted at / (rm ... /)"
+scope = "line"
+
+[[rule]]
+id = "cmd.fork-bomb"
+severity = "error"
+pattern = ':\(\)\s*\{\s*:\s*\|\s*:&\s*\}\s*;?\s*:'
+message = "Shell fork bomb"
+scope = "line"
+
+[[rule]]
+id = "cmd.chmod-777"
+severity = "warn"
+pattern = '\bchmod\s+(?:-[^;\s]+\s+)*777\b'
+message = "Overly permissive chmod 777"
+scope = "line"
+
+[[rule]]
+id = "cmd.sudo-usage"
+severity = "warn"
+pattern = '(?:^|[\s;&|])sudo\s+\S'
+message = "sudo invocation in added line"
+scope = "line"
+
+[[rule]]
+id = "cmd.git-push-force"
+severity = "warn"
+pattern = '\bgit\s+push\b.*--force\b'
+message = "git push --force rewrites shared history"
 scope = "line"

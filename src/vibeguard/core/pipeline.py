@@ -52,28 +52,30 @@ def _diff_bytes(files: list[DiffFile]) -> int:
 
 
 def clamp_ai_findings(findings: list[Finding]) -> list[Finding]:
-    """Force every AI finding to severity <= warn and source='ai'.
+    """Force every finding from the AI provider path to severity <= warn and
+    source='ai'.
 
-    Hard invariant: AI-source findings can NEVER cause verdict block; the
-    clamp is applied by the pipeline, never delegated to the provider.
+    Hard invariant: AI-source findings can NEVER cause verdict block. The
+    clamp is applied by the pipeline and does NOT trust the provider-reported
+    ``source`` field — a malicious provider reporting ``source="rule"`` /
+    ``severity="error"`` is still rewritten to ``source="ai"`` and downgraded
+    to warn. Only this function is the boundary between "provider output" and
+    "pipeline findings"; it must treat its entire input as untrusted.
     """
     clamped: list[Finding] = []
     for f in findings:
-        if f.source == "ai":
-            sev = f.severity if f.severity is not Severity.ERROR else Severity.WARN
-            clamped.append(
-                Finding(
-                    rule_id=f.rule_id,
-                    severity=sev,
-                    file=f.file,
-                    line=f.line,
-                    message=f.message,
-                    snippet=f.snippet,
-                    source="ai",
-                )
+        sev = f.severity if f.severity is not Severity.ERROR else Severity.WARN
+        clamped.append(
+            Finding(
+                rule_id=f.rule_id,
+                severity=sev,
+                file=f.file,
+                line=f.line,
+                message=f.message,
+                snippet=f.snippet,
+                source="ai",
             )
-        else:
-            clamped.append(f)
+        )
     return clamped
 
 
@@ -115,7 +117,9 @@ def run_scan(
 
     if ai_provider is not None:
         ai_findings = ai_provider.review(scan_files, list(report.findings), config)
-        all_findings = clamp_ai_findings([*report.findings, *ai_findings])
+        # Clamp ONLY the provider's own output (untrusted), never the
+        # deterministic findings that already went through aggregate().
+        all_findings = [*report.findings, *clamp_ai_findings(ai_findings)]
         report = aggregate(all_findings, strict=config.strict)
 
     duration_ms = (time.monotonic() - start) * 1000.0
