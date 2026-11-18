@@ -1,8 +1,6 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="VibeGuard" width="112" height="112">
+  <img src="assets/logo.png" alt="VibeGuard — Secure · Monitor · Stay safe" width="360">
 </p>
-
-<h1 align="center">VibeGuard</h1>
 
 <p align="center">
   <strong>Local-first safety layer that reviews AI-generated diffs before they land.</strong>
