@@ -11,11 +11,11 @@ from __future__ import annotations
 
 import pytest
 
+from vibeguard.analyzers import default_analyzers
 from vibeguard.analyzers.base import Registry, load_builtin_rules
 from vibeguard.analyzers.dangerous_cmd import DangerousCmdAnalyzer
 from vibeguard.analyzers.secrets import SecretsAnalyzer
 from vibeguard.analyzers.sensitive_paths import SensitivePathsAnalyzer
-from vibeguard.cli import _default_analyzers
 from vibeguard.core.diff import DiffFile
 
 
@@ -194,7 +194,7 @@ def test_path_rules_do_not_scan_content() -> None:
 # -------------------------------------------------------- default wiring
 
 def test_default_analyzers_claim_every_rule_exactly_once() -> None:
-    analyzers = _default_analyzers()
+    analyzers = default_analyzers()
     ids = [a.id for a in analyzers]
     assert sorted(ids) == ["dangerous-cmd", "rules", "secrets", "sensitive-paths"]
     rules = load_builtin_rules()
@@ -208,7 +208,7 @@ def test_default_analyzers_claim_every_rule_exactly_once() -> None:
 
 def test_default_analyzers_register_cleanly() -> None:
     registry = Registry()
-    for a in _default_analyzers():
+    for a in default_analyzers():
         registry.register(a)
     assert set(registry) == {"dangerous-cmd", "rules", "secrets", "sensitive-paths"}
 
@@ -216,6 +216,6 @@ def test_default_analyzers_register_cleanly() -> None:
 def test_wired_scan_reports_each_finding_once() -> None:
     f = _file("deploy.py", "AWS_KEY = 'AKIAABCDEFGHIJKLMNOP'")
     seen: list[str] = []
-    for a in _default_analyzers():
+    for a in default_analyzers():
         seen.extend(found.rule_id for found in a.analyze([f], None))
     assert seen == ["secret.aws-access-key"]

@@ -8,16 +8,12 @@ exit codes 0/1/2/3 per ARCHITECTURE §4). rules/hook/mcp remain stubs
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 
 from vibeguard import __version__
-from vibeguard.analyzers import dangerous_cmd, secrets, sensitive_paths
-from vibeguard.analyzers.base import (
-    Analyzer,
-    ConfigError,
-    RuleAnalyzer,
-    load_builtin_rules,
-)
+from vibeguard.analyzers import default_analyzers
+from vibeguard.analyzers.base import ConfigError
 from vibeguard.core.diff import (
     DiffError,
     DiffFileSource,
@@ -28,6 +24,7 @@ from vibeguard.core.diff import (
     StdinSource,
 )
 from vibeguard.core.pipeline import ScanConfig, run_scan
+from vibeguard.eval import format_eval_text, run_eval
 from vibeguard.formatters.text import format_text
 
 # Exit codes (ARCHITECTURE §4, frozen contract).
@@ -83,6 +80,38 @@ def build_parser() -> VibeGuardParser:
     scan_p.add_argument("--max-findings", metavar="N", type=int, default=None)
     scan_p.set_defaults(func=_cmd_scan)
 
+    # ---- eval ----
+    eval_p = sub.add_parser(
+        "eval",
+        help="measure the analyzers against the labelled diff dataset",
+    )
+    eval_p.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        help="output format (default: text)",
+    )
+    eval_p.add_argument(
+        "--verbose",
+        action="store_true",
+        help="print one line per case",
+    )
+    eval_p.add_argument(
+        "--min-precision",
+        metavar="X",
+        type=float,
+        default=None,
+        help="exit 1 when precision is below X (CI gate)",
+    )
+    eval_p.add_argument(
+        "--min-recall",
+        metavar="Y",
+        type=float,
+        default=None,
+        help="exit 1 when recall is below Y (CI gate)",
+    )
+    eval_p.set_defaults(func=_cmd_eval)
+
     # ---- rules ----
     rules_p = sub.add_parser("rules", help="list rules")
     rules_sub = rules_p.add_subparsers(dest="rules_command", metavar="<subcommand>")
@@ -112,28 +141,6 @@ def build_parser() -> VibeGuardParser:
     mcp_p.set_defaults(func=_cmd_mcp_missing)
 
     return parser
-
-
-# ------------------------------------------------------------ rule analyzer
-
-
-def _default_analyzers() -> list[Analyzer]:
-    """The built-in analyzer set (Phase 2: dedicated modules + generic rest).
-
-    P2.1 compatibility change: the dedicated analyzers claim their id-prefix
-    subsets of builtins.toml; unclaimed rules (e.g. merge.*) keep running
-    through the generic RuleAnalyzer, so Phase-1 behavior is preserved and no
-    rule fires twice.
-    """
-    rules = load_builtin_rules()
-    claimed = (secrets.PREFIX, sensitive_paths.PREFIX, dangerous_cmd.PREFIX)
-    rest = [r for r in rules if not r.id.startswith(claimed)]
-    return [
-        secrets.SecretsAnalyzer(rules),
-        sensitive_paths.SensitivePathsAnalyzer(rules),
-        dangerous_cmd.DangerousCmdAnalyzer(rules),
-        RuleAnalyzer(rest),
-    ]
 
 
 # ------------------------------------------------------------ scan command
@@ -180,7 +187,7 @@ def _cmd_scan(args: argparse.Namespace) -> int:
         return EXIT_INTERNAL
 
     config = ScanConfig(strict=args.strict)
-    analyzers = _default_analyzers()
+    analyzers = default_analyzers()
 
     report = run_scan(diff_files, analyzers, None, config)
 
@@ -189,6 +196,49 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     if report.verdict.value == "block":
         return EXIT_BLOCK
     return EXIT_PASS
+
+
+# ------------------------------------------------------------ eval command
+
+
+def _cmd_eval(args: argparse.Namespace) -> int:
+    report = run_eval()
+
+    if args.format == "json":
+        payload = {
+            "cases_passed": report.cases_passed,
+            "cases_total": report.cases_total,
+            "tp": report.tp,
+            "fp": report.fp,
+            "fn": report.fn,
+            "precision": round(report.precision, 4),
+            "recall": round(report.recall, 4),
+            "f1": round(report.f1, 4),
+            "by_category": {
+                name: {"passed": passed, "total": total}
+                for name, (passed, total) in report.by_category().items()
+            },
+            "cases": [
+                {
+                    "name": case.name,
+                    "category": case.category,
+                    "passed": case.passed,
+                    "expected": sorted(case.expected),
+                    "detected": sorted(case.detected),
+                    "missing": sorted(case.missing),
+                    "unexpected": sorted(case.unexpected),
+                }
+                for case in report.cases
+            ],
+        }
+        print(json.dumps(payload, indent=2))
+    else:
+        print(format_eval_text(report, verbose=args.verbose))
+
+    below = (
+        args.min_precision is not None and report.precision < args.min_precision
+    ) or (args.min_recall is not None and report.recall < args.min_recall)
+    return EXIT_BLOCK if below else EXIT_PASS
 
 
 # ------------------------------------------------------------ stub commands
